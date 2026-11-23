@@ -1,0 +1,46 @@
+version: '3.8'
+
+# Local stand-ins for the cloud services in the architecture:
+#   postgres -> RDS / Aurora, redis -> ElastiCache, sqs (ElasticMQ) -> Amazon SQS
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: flashsale
+      POSTGRES_PASSWORD: flashsale
+      POSTGRES_DB: flashsale
+    ports:
+      - '5433:5432' # 5433 on the host to avoid clashing with a local Postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U flashsale -d flashsale']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    # AOF persistence so dedupe keys and status cache survive a restart.
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  sqs:
+    image: softwaremill/elasticmq-native:1.6.11
+    ports:
+      - '9324:9324' # SQS API
+      - '9325:9325' # Web UI with queue stats
+    volumes:
+      - ./infrastructure/docker/elasticmq.conf:/opt/elasticmq.conf:ro
+
+volumes:
+  postgres-data:
+  redis-data:

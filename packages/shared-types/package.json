@@ -1,0 +1,18 @@
+{
+  "name": "@flash-sale-demo/shared-types",
+  "version": "0.0.0",
+  "private": true,
+  "description": "API contracts shared between backend and frontend",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "flash-sale-demo",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "infra:up": "docker-compose up -d postgres redis sqs",
+    "infra:down": "docker-compose down",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck",
+    "dev:api": "pnpm --filter @flash-sale-demo/backend dev:api",
+    "dev:worker": "pnpm --filter @flash-sale-demo/backend dev:worker",
+    "dev:web": "pnpm --filter @flash-sale-demo/frontend dev"
+  }
+}
