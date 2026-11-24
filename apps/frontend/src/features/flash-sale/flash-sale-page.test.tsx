@@ -121,6 +121,8 @@ describe('FlashSalePage', () => {
     await user.click(screen.getByRole('button', { name: /buy now/i }));
 
     expect(await screen.findByText("You're in the queue")).toBeVisible();
+    expect(screen.getByRole('button', { name: /processing/i })).toBeDisabled();
+    expect(screen.getByLabelText(/username or email/i)).toBeDisabled();
     const stream = FakeEventSource.instances[0];
     expect(stream.url).toBe(`${purchasePath}/${pendingRequest().purchaseRequestId}/events`);
 
@@ -128,6 +130,7 @@ describe('FlashSalePage', () => {
 
     expect(await screen.findByText('Purchase successful!')).toBeVisible();
     expect(stream.readyState).toBe(FakeEventSource.CLOSED);
+    expect(screen.getByLabelText(/username or email/i)).toBeEnabled();
   });
 
   it('tells the user when the sale is sold out', async () => {

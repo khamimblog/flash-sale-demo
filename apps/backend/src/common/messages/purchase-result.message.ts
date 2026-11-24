@@ -1,7 +1,6 @@
 import { PurchaseStatus } from '@flash-sale-demo/shared-types';
 import { z } from 'zod';
 
-/** Published by the worker to the purchase-results queue; consumed by notifications. */
 export const purchaseResultMessageSchema = z.object({
   purchaseRequestId: z.uuid(),
   flashSaleId: z.uuid(),

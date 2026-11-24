@@ -1,7 +1,56 @@
 version: '3.8'
 
 # Local stand-ins for the cloud services in the architecture:
-#   postgres -> RDS / Aurora, redis -> ElastiCache, sqs (ElasticMQ) -> Amazon SQS
+#   postgres -> RDS / Aurora, redis -> ElastiCache, sqs (ElasticMQ) -> Amazon SQS,
+#   web (nginx) -> CloudFront + S3 for the app and an ALB in front of the API.
+#
+#   pnpm infra:up    postgres, redis, sqs only (run the apps on the host with pnpm dev:*)
+#   pnpm stack:up    everything: 2 API instances behind nginx + 2 workers, on :8080
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: apps/backend/Dockerfile
+  image: flash-sale-demo-backend
+  restart: unless-stopped
+  environment: &backend-env
+    NODE_ENV: production
+    LOG_LEVEL: info
+    DATABASE_URL: postgres://flashsale:flashsale@postgres:5432/flashsale
+    REDIS_URL: redis://redis:6379
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: local
+    AWS_SECRET_ACCESS_KEY: local
+    SQS_ENDPOINT: http://sqs:9324
+    PURCHASE_REQUESTS_QUEUE_URL: http://sqs:9324/000000000000/purchase-requests
+    PURCHASE_RESULTS_QUEUE_URL: http://sqs:9324/000000000000/purchase-results
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+    sqs:
+      condition: service_started
+
+x-api: &api
+  <<: *backend
+  environment:
+    <<: *backend-env
+    DATABASE_POOL_SIZE: 10 # the API rarely queries Postgres (cached sale, status fallback)
+  healthcheck:
+    test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/api/health/ready || exit 1']
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+x-worker: &worker
+  <<: *backend
+  command: ['node', 'dist/main.worker.js']
+  environment:
+    <<: *backend-env
+    DATABASE_POOL_SIZE: 20
+    WORKER_POLLERS: 2 # 2 pollers × 10 messages = 20 in flight, one per DB connection
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -40,6 +89,34 @@ services:
       - '9325:9325' # Web UI with queue stats
     volumes:
       - ./infrastructure/docker/elasticmq.conf:/opt/elasticmq.conf:ro
+
+  migrate:
+    <<: *backend
+    command: ['node', 'dist/main.migrate.js']
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-1: *api
+  api-2: *api
+
+  worker-1: *worker
+  worker-2: *worker
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+    image: flash-sale-demo-web
+    restart: unless-stopped
+    ports:
+      - '8080:80'
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
 
 volumes:
   postgres-data:

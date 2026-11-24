@@ -82,6 +82,7 @@ export function PurchasePanel({
               onChange={(e) => onUserIdChange(e.target.value)}
               placeholder="Enter your username or email (e.g. john@example.com)"
               autoComplete="username"
+              disabled={busy}
               aria-invalid={validationError ? true : undefined}
               aria-describedby={validationError ? 'user-id-error' : undefined}
               className="h-11 pl-9"
