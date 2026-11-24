@@ -1,8 +1,18 @@
-import { PurchaseStatus, type PurchaseRequestResponse } from '@flash-sale-demo/shared-types';
+import {
+  FINAL_PURCHASE_STATUSES,
+  PurchaseStatus,
+  type PurchaseRequestResponse,
+} from '@flash-sale-demo/shared-types';
 import { Inject, Injectable } from '@nestjs/common';
 import Redis, { type Result } from 'ioredis';
 import { RedisKeys, SALE_KEY_TTL_SECONDS } from '../../infrastructure/redis/redis-keys';
 import { REDIS } from '../../infrastructure/redis/redis.tokens';
+
+/**
+ * A decided request only needs to stay in Redis for the post-sale "did I win?" rush;
+ * after that, lookups fall back to Postgres.
+ */
+const FINAL_STATUS_TTL_SECONDS = 60 * 60;
 
 /**
  * Atomically: return the user's existing request, or reject if no units are left, or
@@ -96,6 +106,9 @@ export class PurchaseRequestStore {
 
   async save(request: PurchaseRequestResponse): Promise<void> {
     const key = RedisKeys.request(request.flashSaleId, request.purchaseRequestId);
+    const ttl = FINAL_PURCHASE_STATUSES.includes(request.status)
+      ? FINAL_STATUS_TTL_SECONDS
+      : SALE_KEY_TTL_SECONDS;
     await this.redis
       .multi()
       .hset(key, {
@@ -104,7 +117,7 @@ export class PurchaseRequestStore {
         status: request.status,
         updatedAt: request.updatedAt,
       })
-      .expire(key, SALE_KEY_TTL_SECONDS)
+      .expire(key, ttl)
       .exec();
   }
 

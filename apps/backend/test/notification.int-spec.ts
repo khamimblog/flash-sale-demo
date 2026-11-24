@@ -7,6 +7,7 @@ import { ApiModule } from '../src/api.module';
 import { configureApiApp } from '../src/app.setup';
 import type { PurchaseResultMessage } from '../src/common/messages/purchase-result.message';
 import { DATABASE, type Database } from '../src/infrastructure/database/database.tokens';
+import { RedisKeys } from '../src/infrastructure/redis/redis-keys';
 import { REDIS } from '../src/infrastructure/redis/redis.tokens';
 import { createSale, truncateAll } from './support/test-database';
 import { createTestSqsClient, drainQueue } from './support/test-queue';
@@ -130,6 +131,23 @@ describe('Notifications (results queue → Redis → SSE)', () => {
       (s) => s !== PurchaseStatus.PENDING,
     );
     expect(status).toBe(PurchaseStatus.SOLD_OUT);
+  });
+
+  it('keeps a final status in Redis for 1h, but the dedupe key for the whole sale', async () => {
+    const sale = await createSale(db, { stock: 10 });
+    const request = await createRequest(sale.id, 'alice');
+    const statusKey = RedisKeys.request(sale.id, request.purchaseRequestId);
+    expect(await redis.ttl(statusKey)).toBeGreaterThan(60 * 60); // PENDING: 24h
+
+    await publishResult(request, PurchaseStatus.SUCCESS);
+    const ttl = await waitFor(
+      () => redis.ttl(statusKey),
+      (seconds) => seconds <= 60 * 60,
+    );
+
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(60 * 60);
+    expect(await redis.ttl(RedisKeys.userRequest(sale.id, 'alice'))).toBeGreaterThan(60 * 60);
   });
 
   it('returns 404 instead of a stream for an unknown request', async () => {

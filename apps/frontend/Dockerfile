@@ -16,6 +16,8 @@ COPY apps/frontend apps/frontend
 RUN pnpm --filter @flash-sale-demo/frontend build
 
 FROM nginx:1.27-alpine
-COPY infrastructure/docker/nginx.conf /etc/nginx/conf.d/default.conf
+# Rendered to /etc/nginx/conf.d/default.conf at startup, with the variables below filled in.
+COPY infrastructure/docker/nginx.conf.template /etc/nginx/templates/default.conf.template
+ENV API_RATE_LIMIT=1500 API_RATE_BURST=500
 COPY --from=build /repo/apps/frontend/dist /usr/share/nginx/html
 EXPOSE 80

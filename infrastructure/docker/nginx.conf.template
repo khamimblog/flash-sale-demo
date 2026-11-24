@@ -1,5 +1,8 @@
 # Serves the React app and load-balances the API across its instances
 # (stand-in for CloudFront + S3 and an ALB).
+#
+# A template: the nginx image fills in ${VARS} from the environment at startup, and only
+# variables that are set, so nginx's own $host, $upstream_addr, ... are left alone.
 
 # Docker's DNS. Instances are re-resolved every 10s, so a restarted container (new IP)
 # is picked up and a stopped one drops out.
@@ -7,11 +10,24 @@ resolver 127.0.0.11 valid=10s ipv6=off;
 
 upstream api {
   zone api 64k;
-  # Out for 5s after 3 failures; one slow connect under load does not take an instance out.
-  server api-1:3000 resolve max_fails=3 fail_timeout=5s;
-  server api-2:3000 resolve max_fails=3 fail_timeout=5s;
+  # Never mark an instance down for being slow (max_fails=0): under load that turned busy
+  # instances into "dead" ones and cascaded into 502s. A stopped instance is still handled:
+  # its request times out after 2s and is retried on the other, and DNS drops it within 10s.
+  server api-1:3000 resolve max_fails=0;
+  server api-2:3000 resolve max_fails=0;
   keepalive 64; # reuse upstream connections instead of opening one per request
 }
+
+# Load shedding: one global budget for the whole API (not per client). Above it, requests get
+# an immediate 429 instead of queueing until the instances overload and nginx cascades into
+# 502s. API_RATE_LIMIT / API_RATE_BURST come from the environment: set them from a capacity
+# test of the deployment, minus headroom (see docker-compose.yml).
+# A constant key, because nginx does not count requests whose key is empty.
+map $host $api_limit_key {
+  default api;
+}
+limit_req_zone $api_limit_key zone=api_capacity:1m rate=${API_RATE_LIMIT}r/s;
+limit_req_status 429;
 
 # Which instance served each request, and how long it took.
 log_format upstream '$remote_addr "$request" $status $request_time upstream=$upstream_addr ($upstream_status)';
@@ -32,6 +48,8 @@ server {
   }
 
   location /api/ {
+    limit_req zone=api_capacity burst=${API_RATE_BURST} nodelay; # absorb short spikes, shed sustained overload
+    error_page 429 = @overloaded;
     proxy_pass http://api;
     proxy_http_version 1.1;
     proxy_set_header Connection '';
@@ -39,6 +57,12 @@ server {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_next_upstream error timeout http_502 http_503; # retry another instance if one is down
     proxy_next_upstream_tries 2; # ...but only once, so retries cannot snowball under overload
+  }
+
+  location @overloaded {
+    default_type application/json;
+    add_header Retry-After 1 always;
+    return 429 '{"statusCode":429,"message":"Too many requests right now, please retry in a moment"}';
   }
 
   location /static/ {

@@ -74,8 +74,37 @@ on the same laptop (nginx ≈ 1 core and k6 ≈ 1.5 cores of it). Workers: 2 pol
   single stock row is the limit, as expected; stock buckets are the next step.
 - **Above capacity the API cascades.** At 2,500/s, a saturated instance is slow to accept
   connections, nginx marks it down, the other takes double load and goes down too. Even then
-  no guarantee broke (exactly 1,000 sold, one per buyer). Load shedding (a global
-  `limit_req` in nginx returning 429/503 above measured capacity) would turn this into fast,
-  clean rejections.
+  no guarantee broke (exactly 1,000 sold, one per buyer). Fixed by load shedding, below.
 - **Failover:** with `api-1` stopped, 20/20 requests succeeded; only the first paid a 1s
   connect timeout before nginx routed around it.
+
+## Load shedding (2026-11-25)
+
+nginx now enforces one global budget for the API (`limit_req`, 1,500 req/s with a burst of
+500) and answers the excess with an immediate `429` and `Retry-After`. Both values are
+settings (`API_RATE_LIMIT`, `API_RATE_BURST` on the `web` service), because capacity
+depends on the deployment; `API_RATE_LIMIT=100000 pnpm stack:up` turns shedding off to
+measure raw capacity. Upstream instances are
+never marked down for being slow (`max_fails=0`). Same scenario that cascaded above:
+1,000 units, 2,500 attempts/s × 30s.
+
+| | Without shedding | With shedding (2 runs) |
+|---|---|---|
+| Errors (`502` / `504`) | ~40,000 (58–62%) | **0** |
+| Shed as `429` | — | ~29,000, answered in milliseconds |
+| Throughput | ~1,900–2,100 req/s | ~2,250–2,280 req/s |
+| Latency p50 / p95 / p99 | 56 ms / 1–3.4 s / 4–6 s | 3 ms / 160–320 ms / 0.5–2.1 s |
+| Guarantees | ✓ all | ✓ all |
+
+How we got there, because the first attempt was not enough:
+
+1. **Budget = measured capacity (2,000 req/s): still ~58% `502`.** At 2,500/s the k6 load
+   generator uses more of the shared CPU, so the real capacity was lower; a shedding limit
+   needs headroom, not the breaking point. → 1,500 req/s.
+2. **Budget 1,500 req/s: still 20% `502`.** The nginx error log showed the chain: a few
+   connects to busy instances took > 2s, nginx disabled both instances, and every request
+   then failed with `no live upstreams`. With shedding protecting the instances, marking
+   them dead only amplifies overload. → `max_fails=0`.
+3. **Failover re-checked:** with `api-1` stopped, 16/16 requests succeeded; two paid the 2s
+   connect timeout before the retry on `api-2`, and after ~4s DNS re-resolve had dropped
+   the stopped instance.

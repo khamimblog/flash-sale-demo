@@ -162,13 +162,15 @@ The Redis counter can only drift in a safe direction:
 
 | Failure | What happens |
 |---|---|
-| An API instance dies | nginx routes around it (2s connect timeout, re-resolves Docker DNS every 10s). Its SSE clients reconnect (EventSource) to another instance; results reach every instance through Redis pub/sub |
+| Traffic above capacity | nginx sheds the excess with an immediate `429` and `Retry-After`, from one global budget set below the measured capacity, so the instances keep answering in milliseconds instead of collapsing. The frontend shows "busy, try again in a moment" |
+| An API instance dies | nginx routes around it: a 2s connect timeout and a retry on the other instance, and Docker DNS is re-resolved every 10s, so a stopped instance drops out. Busy instances are never marked dead (`max_fails=0`). Its SSE clients reconnect (EventSource) to another instance; results reach every instance through Redis pub/sub |
 | A worker dies mid-transaction | The transaction rolls back. The message reappears after the 30s visibility timeout and another worker processes it |
 | A worker dies after commit, before publishing the result | The redelivered message finds the recorded request and republishes the same outcome; nothing is applied twice |
 | A message fails repeatedly (bad payload, bug) | After 5 receives it moves to a dead-letter queue for inspection. Redriving it is safe, because handling is idempotent |
 | SQS unavailable at the API | The reservation is undone (unit and dedupe key returned) and the client gets `503`, so it can retry |
 | Redis unavailable at the API | Fail closed: `503`. Admitting without Redis would be safe for correctness but floods the queue (see future improvements) |
 | Redis loses data | Counter re-seeded from Postgres; duplicate buyers are still stopped by the unique constraint; status lookups fall back to Postgres |
+| Postgres unavailable | The worker's transactions fail and messages are retried, so nothing is lost or decided wrongly. **Known gap:** after 5 attempts (~2.5 minutes at a 30s visibility timeout) they move to the dead-letter queue and need a redrive once Postgres is back. A longer retry policy would ride out longer outages |
 | The user reloads or loses the connection | The status is stored, not only pushed: the page resumes from the saved status, SSE sends the current status on connect, and polling is the fallback |
 | Shutdown or deploy | Consumers stop polling and finish in-flight messages before connections close; open SSE streams complete |
 
@@ -184,9 +186,12 @@ The main decisions, with the alternatives considered:
   on Redis durability. Making Redis authoritative with asynchronous database writes would be
   faster, but a Redis failover could lose writes and oversell. *Cost:* every sale pays one
   Postgres transaction per admitted buyer, about `stock` transactions in total.
-- **Postgres over MongoDB.** Inventory and orders need transactions plus `CHECK`, `UNIQUE`
-  and foreign-key constraints as the last line of defence. The data is relational, and both
-  databases serialise writes to a single hot record anyway.
+- **Postgres over MongoDB.** MongoDB could do this correctly too: an atomic
+  `findOneAndUpdate` with a `$gt` guard, unique indexes, and multi-document transactions.
+  Postgres fits better here: the data is relational (product → sale → orders) and enforced
+  with foreign keys, transactions are its default model rather than an add-on that needs a
+  replica set, and `CHECK` and `UNIQUE` constraints are declared in one place as the last line
+  of defence. In both databases, one hot stock record is updated one write at a time.
 - **SSE plus Redis pub/sub for results.** SSE is one-way and plain HTTP, which is all a
   status push needs, so WebSockets aren't required. SQS delivers each result to one API
   instance, but the user may be connected to another, so pub/sub fans it out. Statuses are
@@ -202,6 +207,17 @@ The main decisions, with the alternatives considered:
 - **In-memory sale cache per API instance (1s TTL, concurrent misses merged).** Postgres
   sees at most one sale read per second per instance. A shared Redis cache would save
   little and add a network hop to every request.
+- **Global load shedding instead of per-user rate limiting.** The danger in a flash sale is
+  total traffic, not one noisy user: repeat clicks are already cheap, because the dedupe
+  answers them from Redis. So nginx enforces one budget for the whole API, set below the
+  capacity the stress tests measured, and answers the excess with a fast `429`. *Cost:* the
+  limit depends on the deployment. It is a setting, not a constant: `API_RATE_LIMIT`
+  (default 1,500 req/s, from 2 instances on a laptop) and `API_RATE_BURST` (default 500).
+  Retune them from a capacity test whenever instances or hardware change. To measure raw
+  capacity, turn shedding off with `API_RATE_LIMIT=100000 pnpm stack:up`.
+- **Redis keys expire on their own.** A pending request's status lives for 24h. Once it is
+  final, its status lives for 1h, which covers the post-sale "did I win?" rush; later
+  lookups fall back to Postgres. The dedupe key stays for the whole sale.
 - **Normalised data model:** `products` → `flash_sales` (stock allocated to a time-boxed
   sale) → `orders` and `purchase_requests`. "One per user" means one per sale.
 - **The stock meter shows completed purchases**, from Postgres. For a few seconds it can
@@ -222,6 +238,11 @@ Laptop (WSL2, 16 cores, 8 GB), with k6 on the same machine:
 | 1 API, 1 worker | 1,000 units, 1,000 req/s × 30s | 928 req/s | 25 / 170 ms | ✓ |
 | 2 APIs + nginx, 2 workers | 1,000 units, 2,000 req/s × 30s | 1,855 req/s, 0 errors | 154 / 256 ms | ✓ |
 | 2 APIs + nginx, 2 workers | 50,000 units, all accepted | 436 req/s; worker ~194 purchases/s | 72 / 119 ms | ✓ |
+| 2 APIs + nginx, **no load shedding** | 1,000 units, 2,500 req/s × 30s (overload) | ~60% `502`, cascade | 1–3 s / 4–6 s | ✓ |
+| 2 APIs + nginx, **load shedding** | 1,000 units, 2,500 req/s × 30s (overload) | 2,250 req/s, **0 errors**; ~29k shed as `429` | 160–320 / 515 ms–2.1 s | ✓ |
+
+The first three rows were measured before load shedding was added, to find the capacity it
+is now set from.
 
 Every run passed all checks:
 - exactly `stock` orders, and never more;
@@ -236,19 +257,20 @@ Every run passed all checks:
    reordering the transaction made purchases about 1.55× faster.
 2. **API CPU.** About 1,000 req/s per Node process; adding instances scales it roughly
    linearly.
-3. **nginx failure handling.** The defaults hung for 60s on a stopped instance, and a
-   timeout that was too aggressive marked busy instances as dead.
+3. **nginx failure handling.** The defaults hung for 60s on a stopped instance.
+4. **Overload cascade.** Above capacity, slow-to-accept instances were marked dead, the other
+   took double load and failed too: ~60% `502`s at 2,500 req/s. Fixed with global load
+   shedding (1,500 req/s budget, burst 500) and never marking busy instances dead. The same
+   overload now produces fast `429`s and zero errors.
 
-**What's left:**
-- Above capacity (2,500 req/s here), nginx cascades into `502` responses. Even then no
-  guarantee broke. Global load shedding (nginx `limit_req`) would turn this into fast `429`s.
-- One sale's purchases still commit one at a time on its stock row.
+**What's left:** one sale's purchases still commit one at a time on its stock row (about
+190/s). A 1,000-unit sale is fully decided in about 5 seconds, which is acceptable here.
 
 Run it yourself:
 
 ```bash
 pnpm stack:up
-BASE_URL=http://localhost:8080 RATE=2000 DURATION=30s STOCK=1000 pnpm stress
+BASE_URL=http://localhost:8080 RATE=2500 DURATION=30s STOCK=1000 pnpm stress
 ```
 
 ## Running locally and testing
@@ -291,7 +313,7 @@ pnpm typecheck && pnpm lint
 |---|---|
 | `GET /api/flash-sales/current` | The running sale, or the next upcoming one, or the last ended one: status (`UPCOMING` / `ACTIVE` / `ENDED` / `SOLD_OUT`), product, window, stock, server time |
 | `GET /api/flash-sales/:saleId` | The same, for a specific sale |
-| `POST /api/flash-sales/:saleId/purchase-requests` `{ userId }` | `202` queued · `200` this user's existing request · `409 {status}` `SOLD_OUT` / `SALE_NOT_ACTIVE` · `400` invalid user · `503` retry |
+| `POST /api/flash-sales/:saleId/purchase-requests` `{ userId }` | `202` queued · `200` this user's existing request · `409 {status}` `SOLD_OUT` / `SALE_NOT_ACTIVE` · `400` invalid user · `429` overloaded, retry (from nginx) · `503` retry |
 | `GET /api/flash-sales/:saleId/purchase-requests?userId=` | "Did this user secure an item?": the user's request and its status, or `404` |
 | `GET /api/flash-sales/:saleId/purchase-requests/:id` | A request's status |
 | `GET /api/flash-sales/:saleId/purchase-requests/:id/events` | SSE: `status` events until final, `heartbeat` every 15s |
@@ -331,16 +353,27 @@ deliberate simplification for a service this size.
 
 ## Future improvements
 
-- **Load shedding:** a global `limit_req` in nginx at the measured capacity, so an overload
-  returns fast `429`s instead of cascading. Per-user rate limiting is less useful here,
-  because the dedupe already makes repeat clicks cheap.
-- **Stock buckets:** split a sale's stock across N rows and take a unit from a random row
-  with `FOR UPDATE SKIP LOCKED`, so N purchases can commit in parallel.
+- **Stock buckets:** split the product's stock across N rows and take a unit from a random
+  row that still has stock, with `FOR UPDATE SKIP LOCKED`, so N purchases can commit in
+  parallel. Each row keeps the same `remaining > 0` guard and `CHECK`, so it is still
+  impossible to oversell. The costs: "sold out" now means *every* bucket is empty (not just
+  the unlocked ones), the stock meter becomes a `SUM`, and the last few units queue on the
+  last buckets again. Time to decide every buyer at ~190 decisions/s per row:
+
+  | Stock | 1 row (today) | 10 buckets |
+  |---|---|---|
+  | 1,000 | ~5 s | ~0.5 s |
+  | 10,000 | ~53 s | ~5 s |
+  | 100,000 | ~9 min | ~53 s |
+
+  For a 1,000-unit sale, one row is fast enough, so this stays a documented next step.
 - **Circuit breaker for Redis:** today a Redis outage stops sales (fail closed). A fail-open
   breaker could queue directly. That is safe because the worker revalidates in Postgres;
   the cost is no API-side filtering and a larger backlog.
-- **Shorter Redis TTL for final statuses:** 24h → ~1h after a request is final. Memory is
-  small today (~0.4 MB per 1,000 units).
+- **Longer worker retries:** a higher `maxReceiveCount` or exponential backoff, so a
+  Postgres outage of many minutes doesn't push messages into the dead-letter queue.
+- **Adaptive load shedding:** derive the limit from live latency or queue depth instead of
+  a fixed number tuned by stress tests.
 - **Bot protection and authentication:** real user identity (today `userId` is
   self-declared), CAPTCHA or a waiting room for very large drops.
 - **Observability:** metrics for queue depth, decision latency, counter drift and DLQ size,

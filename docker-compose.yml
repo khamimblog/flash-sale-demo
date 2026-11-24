@@ -110,6 +110,12 @@ services:
       dockerfile: apps/frontend/Dockerfile
     image: flash-sale-demo-web
     restart: unless-stopped
+    environment:
+      # Load shedding budget for the whole API, from the stress tests on a laptop with 2 API
+      # instances (≈ 2,000 req/s capacity, minus headroom). Retune per deployment; set a very
+      # high value (e.g. API_RATE_LIMIT=100000 pnpm stack:up) to measure raw capacity.
+      API_RATE_LIMIT: ${API_RATE_LIMIT:-1500}
+      API_RATE_BURST: ${API_RATE_BURST:-500}
     ports:
       - '8080:80'
     depends_on:
