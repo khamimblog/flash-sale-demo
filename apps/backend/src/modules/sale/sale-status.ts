@@ -5,7 +5,6 @@ export interface SaleWindow {
   endsAt: Date;
 }
 
-/** Inclusive start, exclusive end: [startsAt, endsAt). */
 export function isWithinWindow(sale: SaleWindow, at: Date): boolean {
   return at >= sale.startsAt && at < sale.endsAt;
 }

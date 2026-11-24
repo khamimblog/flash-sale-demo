@@ -21,7 +21,6 @@ export class PurchaseUpdatesBus implements OnModuleInit, OnModuleDestroy {
   readonly updates$: Observable<PurchaseRequestResponse> = this.updates.asObservable();
 
   constructor(@Inject(REDIS) private readonly redis: Redis) {
-    // A connection in subscriber mode cannot run other commands, so it gets its own.
     this.subscriber = redis.duplicate();
   }
 
@@ -40,7 +39,6 @@ export class PurchaseUpdatesBus implements OnModuleInit, OnModuleDestroy {
     await this.redis.publish(RedisChannels.purchaseUpdates, JSON.stringify(update));
   }
 
-  /** Completing the subject ends every open SSE stream, so clients reconnect elsewhere. */
   async onModuleDestroy(): Promise<void> {
     this.updates.complete();
     await this.subscriber.quit();

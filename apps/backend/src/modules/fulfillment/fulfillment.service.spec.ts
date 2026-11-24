@@ -3,7 +3,7 @@ import { PurchaseStatus } from '@flash-sale-demo/shared-types';
 import type { ConfigService } from '@nestjs/config';
 import type { Env } from '../../common/config/env.schema';
 import type { QueuePublisher } from '../../infrastructure/queue/queue-publisher';
-import type { SaleAvailabilityStore } from '../sale/sale-availability.store';
+import type { SaleStockCounter } from '../sale/sale-stock-counter';
 import type { FulfillmentRepository } from './fulfillment.repository';
 import { FulfillmentService } from './fulfillment.service';
 
@@ -11,14 +11,15 @@ const RESULTS_QUEUE = 'http://sqs.local/purchase-results';
 
 function setup() {
   const repository = { fulfill: jest.fn() } as unknown as jest.Mocked<FulfillmentRepository>;
-  const availability = {
+  const stockCounter = {
     markSoldOut: jest.fn(),
-  } as unknown as jest.Mocked<SaleAvailabilityStore>;
+    restoreUnit: jest.fn(),
+  } as unknown as jest.Mocked<SaleStockCounter>;
   const publisher = { publish: jest.fn() } as unknown as jest.Mocked<QueuePublisher>;
   const config = { get: () => RESULTS_QUEUE } as unknown as ConfigService<Env, true>;
 
-  const service = new FulfillmentService(repository, availability, publisher, config);
-  return { service, repository, availability, publisher };
+  const service = new FulfillmentService(repository, stockCounter, publisher, config);
+  return { service, repository, stockCounter, publisher };
 }
 
 const message = () => ({
@@ -30,8 +31,8 @@ const message = () => ({
 
 describe('FulfillmentService', () => {
   it('publishes the outcome to the results queue', async () => {
-    const { service, repository, publisher, availability } = setup();
-    repository.fulfill.mockResolvedValue({ status: PurchaseStatus.SUCCESS, soldOut: false });
+    const { service, repository, publisher, stockCounter } = setup();
+    repository.fulfill.mockResolvedValue({ status: PurchaseStatus.SUCCESS, soldOut: false, redelivered: false });
     const request = message();
 
     await service.handle(request);
@@ -44,17 +45,48 @@ describe('FulfillmentService', () => {
         status: PurchaseStatus.SUCCESS,
       }),
     );
-    expect(availability.markSoldOut).not.toHaveBeenCalled();
+    expect(stockCounter.markSoldOut).not.toHaveBeenCalled();
   });
 
   it('marks the sale sold out when the database says stock is gone', async () => {
-    const { service, repository, availability } = setup();
-    repository.fulfill.mockResolvedValue({ status: PurchaseStatus.SUCCESS, soldOut: true });
+    const { service, repository, stockCounter } = setup();
+    repository.fulfill.mockResolvedValue({
+      status: PurchaseStatus.SUCCESS,
+      soldOut: true,
+      redelivered: false,
+    });
     const request = message();
 
     await service.handle(request);
 
-    expect(availability.markSoldOut).toHaveBeenCalledWith(request.flashSaleId);
+    expect(stockCounter.markSoldOut).toHaveBeenCalledWith(request.flashSaleId);
+    expect(stockCounter.restoreUnit).not.toHaveBeenCalled();
+  });
+
+  it.each([PurchaseStatus.ALREADY_PURCHASED, PurchaseStatus.SALE_NOT_ACTIVE])(
+    'gives the reserved unit back when rejected as %s',
+    async (status) => {
+      const { service, repository, stockCounter } = setup();
+      repository.fulfill.mockResolvedValue({ status, soldOut: false, redelivered: false });
+      const request = message();
+
+      await service.handle(request);
+
+      expect(stockCounter.restoreUnit).toHaveBeenCalledWith(request.flashSaleId);
+    },
+  );
+
+  it('does not give a unit back twice when the message is redelivered', async () => {
+    const { service, repository, stockCounter } = setup();
+    repository.fulfill.mockResolvedValue({
+      status: PurchaseStatus.ALREADY_PURCHASED,
+      soldOut: false,
+      redelivered: true,
+    });
+
+    await service.handle(message());
+
+    expect(stockCounter.restoreUnit).not.toHaveBeenCalled();
   });
 
   it('rejects malformed messages without touching the database', async () => {
@@ -66,7 +98,7 @@ describe('FulfillmentService', () => {
 
   it('propagates publish failures so the message is retried', async () => {
     const { service, repository, publisher } = setup();
-    repository.fulfill.mockResolvedValue({ status: PurchaseStatus.SUCCESS, soldOut: false });
+    repository.fulfill.mockResolvedValue({ status: PurchaseStatus.SUCCESS, soldOut: false, redelivered: false });
     publisher.publish.mockRejectedValue(new Error('SQS unavailable'));
 
     await expect(service.handle(message())).rejects.toThrow('SQS unavailable');

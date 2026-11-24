@@ -4,24 +4,7 @@ import {
   type PurchaseStatus,
 } from '@flash-sale-demo/shared-types';
 import { Injectable, type MessageEvent } from '@nestjs/common';
-import {
-  EMPTY,
-  Subject,
-  catchError,
-  defer,
-  distinctUntilChanged,
-  filter,
-  finalize,
-  interval,
-  map,
-  merge,
-  of,
-  startWith,
-  takeUntil,
-  takeWhile,
-  timer,
-  type Observable,
-} from 'rxjs';
+import { Observable, filter, of } from 'rxjs';
 import { purchaseResultMessageSchema } from '../../common/messages/purchase-result.message';
 import { PurchaseRequestStore } from '../purchase/purchase-request.store';
 import { PurchaseService } from '../purchase/purchase.service';
@@ -42,11 +25,6 @@ export class NotificationService {
     private readonly bus: PurchaseUpdatesBus,
   ) {}
 
-  /**
-   * Handles one message from the purchase-results queue: record the final status
-   * (so polling and late subscribers see it), then notify live subscribers.
-   * Both steps are idempotent, so SQS redelivery is harmless.
-   */
   async handleResult(body: unknown): Promise<void> {
     const result = purchaseResultMessageSchema.parse(body);
     const update: PurchaseRequestResponse = {
@@ -60,39 +38,40 @@ export class NotificationService {
     await this.bus.publish(update);
   }
 
-  /**
-   * SSE stream for one purchase request: the current status first, then changes,
-   * completing once the status is final. Throws 404 before the stream opens if the
-   * request does not exist.
-   */
   async watch(flashSaleId: string, purchaseRequestId: string): Promise<Observable<MessageEvent>> {
     const current = await this.purchases.findById(flashSaleId, purchaseRequestId);
     if (isFinal(current.status)) return of(statusEvent(current));
 
-    const updates$ = this.bus.updates$.pipe(
-      filter((update) => update.purchaseRequestId === purchaseRequestId),
-    );
-    // Read again after subscribing to updates, so a result that landed between the
-    // first read and the subscription is not missed.
-    const reread$ = defer(() => this.purchases.findById(flashSaleId, purchaseRequestId)).pipe(
-      catchError(() => EMPTY),
-    );
+    return new Observable<MessageEvent>((stream) => {
+      const send = (request: PurchaseRequestResponse) => {
+        stream.next(statusEvent(request));
+        if (isFinal(request.status)) stream.complete();
+      };
 
-    const done$ = new Subject<void>();
-    const status$ = merge(updates$, reread$).pipe(
-      startWith(current),
-      distinctUntilChanged((a, b) => a.status === b.status),
-      takeWhile((request) => !isFinal(request.status), true),
-      takeUntil(timer(MAX_STREAM_DURATION_MS)),
-      finalize(() => done$.next()),
-      map(statusEvent),
-    );
-    const heartbeat$ = interval(HEARTBEAT_INTERVAL_MS).pipe(
-      takeUntil(done$),
-      map((): MessageEvent => ({ type: 'heartbeat', data: {} })),
-    );
+      send(current);
 
-    return merge(status$, heartbeat$);
+      const updates = this.bus.updates$
+        .pipe(filter((update) => update.purchaseRequestId === purchaseRequestId))
+        .subscribe({ next: send, complete: () => stream.complete() });
+
+      this.purchases
+        .findById(flashSaleId, purchaseRequestId)
+        .then((latest) => isFinal(latest.status) && send(latest))
+        .catch(() => undefined);
+
+      const heartbeat = setInterval(
+        () => stream.next({ type: 'heartbeat', data: {} }),
+        HEARTBEAT_INTERVAL_MS,
+      );
+
+      const timeout = setTimeout(() => stream.complete(), MAX_STREAM_DURATION_MS);
+
+      return () => {
+        updates.unsubscribe();
+        clearInterval(heartbeat);
+        clearTimeout(timeout);
+      };
+    });
   }
 }
 

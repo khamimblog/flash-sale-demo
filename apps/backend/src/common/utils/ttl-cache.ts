@@ -1,9 +1,3 @@
-/**
- * Tiny in-process read-through cache.
- *
- * It caches the *promise*, so concurrent misses for the same key share one load
- * (no thundering herd on the database). Failed loads are not cached.
- */
 export class TtlCache<V> {
   private readonly entries = new Map<string, { value: Promise<V>; expiresAt: number }>();
 

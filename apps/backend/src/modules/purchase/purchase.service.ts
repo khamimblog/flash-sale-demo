@@ -12,7 +12,6 @@ import { PurchaseRequestRepository } from './purchase-request.repository';
 import { PurchaseRequestStore } from './purchase-request.store';
 
 export interface CreatePurchaseResult {
-  /** False when the user already had a request for this sale and we returned it instead. */
   created: boolean;
   request: PurchaseRequestResponse;
 }
@@ -32,13 +31,6 @@ export class PurchaseService {
     this.requestsQueueUrl = config.get('PURCHASE_REQUESTS_QUEUE_URL', { infer: true });
   }
 
-  /**
-   * Accepts a purchase attempt. Cheap checks run here so that only requests with
-   * a real chance of succeeding reach the queue and the database:
-   *   1. the sale exists and is open (in-memory cached sale),
-   *   2. one Redis round trip: existing request for this user? sold out? else reserve.
-   * The worker makes the final, authoritative decision.
-   */
   async create(flashSaleId: string, userId: string): Promise<CreatePurchaseResult> {
     const sale = await this.sales.getSale(flashSaleId);
     const acceptedAt = new Date();
@@ -47,12 +39,13 @@ export class PurchaseService {
     }
 
     const purchaseRequestId = randomUUID();
-    const reservation = await this.store.reserve(
+    const reservation = await this.store.reserve({
       flashSaleId,
       userId,
       purchaseRequestId,
       acceptedAt,
-    );
+      remainingStock: sale.remainingStock,
+    });
 
     if (reservation.outcome === 'SOLD_OUT') {
       throw new PurchaseRejectedException(PurchaseStatus.SOLD_OUT, 'The sale is sold out');
@@ -83,7 +76,6 @@ export class PurchaseService {
     };
   }
 
-  /** Redis holds the live status; the database is the fallback once that copy is gone. */
   async findById(flashSaleId: string, purchaseRequestId: string): Promise<PurchaseRequestResponse> {
     const request =
       (await this.store.findById(flashSaleId, purchaseRequestId)) ??
@@ -92,7 +84,6 @@ export class PurchaseService {
     return request;
   }
 
-  /** "Did this user secure an item?": the user's single request for this sale. */
   async findByUser(flashSaleId: string, userId: string): Promise<PurchaseRequestResponse> {
     const id = await this.store.findIdByUser(flashSaleId, userId);
     if (id) return this.findById(flashSaleId, id);
@@ -106,7 +97,6 @@ export class PurchaseService {
     try {
       await this.publisher.publish(this.requestsQueueUrl, message);
     } catch (error) {
-      // Undo the reservation so the user is not locked out by a request that never queued.
       await this.store.release(message.flashSaleId, message.userId, message.purchaseRequestId);
       this.logger.error({ err: error }, 'Failed to enqueue purchase request');
       throw new ServiceUnavailableException('Could not accept the purchase right now, please retry');

@@ -34,7 +34,6 @@ export class PurchaseController {
     return request;
   }
 
-  /** Lookup by user: answers "did this user secure an item?". */
   @Get()
   findByUser(
     @Param('saleId', ParseUUIDPipe) saleId: string,

@@ -13,6 +13,7 @@ import { configureApiApp } from '../src/app.setup';
 import type { PurchaseRequestMessage } from '../src/common/messages/purchase-request.message';
 import type { Database } from '../src/infrastructure/database/database.tokens';
 import { DATABASE } from '../src/infrastructure/database/database.tokens';
+import { QueuePublisher } from '../src/infrastructure/queue/queue-publisher';
 import { RedisKeys } from '../src/infrastructure/redis/redis-keys';
 import { REDIS } from '../src/infrastructure/redis/redis.tokens';
 import { createSale, truncateAll } from './support/test-database';
@@ -143,9 +144,26 @@ describe('Purchase API (HTTP → Redis → SQS)', () => {
       expect(res.json()).toMatchObject({ status: PurchaseStatus.SALE_NOT_ACTIVE });
     });
 
-    it('rejects with 409 SOLD_OUT once the sale is marked sold out, without enqueuing', async () => {
+    it('admits only as many requests as there is stock, rejecting the rest without enqueuing', async () => {
+      const sale = await createSale(db, { stock: 5 });
+
+      const responses = await Promise.all(
+        Array.from({ length: 100 }, (_, i) => purchase(sale.id, `user-${i}`)),
+      );
+
+      const codes = responses.map((r) => r.statusCode);
+      expect(codes.filter((c) => c === 202)).toHaveLength(5);
+      expect(codes.filter((c) => c === 409)).toHaveLength(95);
+      expect(responses.find((r) => r.statusCode === 409)!.json()).toMatchObject({
+        status: PurchaseStatus.SOLD_OUT,
+      });
+      expect(await drainQueue(sqs, requestsQueue)).toHaveLength(5);
+      expect(await redis.get(RedisKeys.stock(sale.id))).toBe('0');
+    });
+
+    it('rejects with 409 SOLD_OUT once the worker has zeroed the counter', async () => {
       const sale = await createSale(db, { stock: 10 });
-      await redis.set(RedisKeys.soldOut(sale.id), '1');
+      await redis.set(RedisKeys.stock(sale.id), 0);
 
       const res = await purchase(sale.id, 'alice');
 
@@ -155,14 +173,27 @@ describe('Purchase API (HTTP → Redis → SQS)', () => {
     });
 
     it('still returns a buyer their own request after the sale sells out', async () => {
-      const sale = await createSale(db, { stock: 10 });
+      const sale = await createSale(db, { stock: 1 });
       const first = (await purchase(sale.id, 'alice')).json<PurchaseRequestResponse>();
-      await redis.set(RedisKeys.soldOut(sale.id), '1');
+      expect((await purchase(sale.id, 'bob')).statusCode).toBe(409);
 
       const res = await purchase(sale.id, 'alice');
 
       expect(res.statusCode).toBe(200);
       expect(res.json<PurchaseRequestResponse>().purchaseRequestId).toBe(first.purchaseRequestId);
+    });
+
+    it('gives the unit back and lets the user retry when enqueueing fails', async () => {
+      const sale = await createSale(db, { stock: 1 });
+      jest
+        .spyOn(app.get(QueuePublisher), 'publish')
+        .mockRejectedValueOnce(new Error('SQS unavailable'));
+
+      const failed = await purchase(sale.id, 'alice');
+
+      expect(failed.statusCode).toBe(503);
+      expect(await redis.get(RedisKeys.stock(sale.id))).toBe('1');
+      expect((await purchase(sale.id, 'alice')).statusCode).toBe(202);
     });
 
     it.each([

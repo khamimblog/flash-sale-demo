@@ -19,7 +19,6 @@ export const purchaseRequests = pgTable('purchase_requests', {
     .references(() => flashSales.id),
   userId: text().notNull(),
   status: purchaseStatusEnum().notNull(),
-  /** When the API accepted the request; used to judge the sale window. */
   acceptedAt: timestamp({ withTimezone: true }).notNull(),
   processedAt: timestamp({ withTimezone: true }),
 });

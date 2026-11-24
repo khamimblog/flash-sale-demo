@@ -25,7 +25,6 @@ export class SaleService {
     this.currentSaleId = new TtlCache(ttlMs);
   }
 
-  /** Sale details for internal use (e.g. purchase validation). Throws 404 if unknown. */
   async getSale(id: string): Promise<FlashSaleDetails> {
     const sale = await this.sales.get(id, () => this.repository.findById(id));
     if (!sale) throw new NotFoundException('Flash sale not found');

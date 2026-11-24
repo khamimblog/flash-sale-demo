@@ -53,7 +53,7 @@ describe('FulfillmentRepository (Postgres)', () => {
 
       const outcome = await repository.fulfill(request(sale.id, 'alice'));
 
-      expect(outcome).toEqual({ status: PurchaseStatus.SUCCESS, soldOut: false });
+      expect(outcome).toEqual({ status: PurchaseStatus.SUCCESS, soldOut: false, redelivered: false });
       expect(await remainingStock(sale.id)).toBe(4);
       expect(await orderCount(sale.id)).toBe(1);
     });
@@ -63,7 +63,7 @@ describe('FulfillmentRepository (Postgres)', () => {
 
       const outcome = await repository.fulfill(request(sale.id, 'alice'));
 
-      expect(outcome).toEqual({ status: PurchaseStatus.SUCCESS, soldOut: true });
+      expect(outcome).toEqual({ status: PurchaseStatus.SUCCESS, soldOut: true, redelivered: false });
     });
 
     it('rejects a second purchase by the same user', async () => {
@@ -82,7 +82,7 @@ describe('FulfillmentRepository (Postgres)', () => {
 
       const outcome = await repository.fulfill(request(sale.id, 'bob'));
 
-      expect(outcome).toEqual({ status: PurchaseStatus.SOLD_OUT, soldOut: true });
+      expect(outcome).toEqual({ status: PurchaseStatus.SOLD_OUT, soldOut: true, redelivered: false });
       expect(await orderCount(sale.id)).toBe(1);
     });
 
@@ -126,7 +126,7 @@ describe('FulfillmentRepository (Postgres)', () => {
       const first = await repository.fulfill(message);
       const second = await repository.fulfill(message);
 
-      expect(second).toEqual(first);
+      expect(second).toEqual({ ...first, redelivered: true });
       expect(await remainingStock(sale.id)).toBe(4);
       expect(await orderCount(sale.id)).toBe(1);
     });
