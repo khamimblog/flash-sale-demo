@@ -14,6 +14,7 @@ import type { PurchaseRequestMessage } from '../src/common/messages/purchase-req
 import type { Database } from '../src/infrastructure/database/database.tokens';
 import { DATABASE } from '../src/infrastructure/database/database.tokens';
 import { QueuePublisher } from '../src/infrastructure/queue/queue-publisher';
+import { PurchaseRequestStore } from '../src/modules/purchase/purchase-request.store';
 import { RedisKeys } from '../src/infrastructure/redis/redis-keys';
 import { REDIS } from '../src/infrastructure/redis/redis.tokens';
 import { createSale, truncateAll } from './support/test-database';
@@ -194,6 +195,18 @@ describe('Purchase API (HTTP → Redis → SQS)', () => {
       expect(failed.statusCode).toBe(503);
       expect(await redis.get(RedisKeys.stock(sale.id))).toBe('1');
       expect((await purchase(sale.id, 'alice')).statusCode).toBe(202);
+    });
+
+    it('returns 503 (retryable), not 500, when Redis is unavailable', async () => {
+      const sale = await createSale(db, { stock: 10 });
+      jest
+        .spyOn(app.get(PurchaseRequestStore), 'reserve')
+        .mockRejectedValueOnce(new Error('Connection is closed.'));
+
+      const res = await purchase(sale.id, 'alice');
+
+      expect(res.statusCode).toBe(503);
+      expect(await drainQueue(sqs, requestsQueue)).toHaveLength(0);
     });
 
     it.each([

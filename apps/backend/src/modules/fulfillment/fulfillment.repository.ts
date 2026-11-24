@@ -18,32 +18,48 @@ export interface FulfillmentOutcome {
   redelivered: boolean;
 }
 
-type Decision = Omit<FulfillmentOutcome, 'redelivered'>;
+const decided = (status: PurchaseStatus, soldOut = false): FulfillmentOutcome => ({
+  status,
+  soldOut,
+  redelivered: false,
+});
 
 @Injectable()
 export class FulfillmentRepository {
   constructor(@Inject(DATABASE) private readonly db: Database) {}
 
+  /**
+   * Every buyer of a sale needs the same stock row, so its lock is taken last and the
+   * transaction commits right after: the lock is held for one UPDATE plus the COMMIT.
+   */
   fulfill(request: PurchaseRequestMessage): Promise<FulfillmentOutcome> {
     return this.db.transaction(async (tx) => {
-      const isFirstDelivery = await this.recordRequest(tx, request);
+      const sale = await this.findSale(tx, request.flashSaleId);
+      const status = !isWithinWindow(sale, new Date(request.acceptedAt))
+        ? PurchaseStatus.SALE_NOT_ACTIVE
+        : sale.remainingStock === 0
+          ? PurchaseStatus.SOLD_OUT
+          : PurchaseStatus.SUCCESS;
+
+      const isFirstDelivery = await this.recordRequest(tx, request, status);
       if (!isFirstDelivery) return this.previousOutcome(tx, request.purchaseRequestId);
+      if (status !== PurchaseStatus.SUCCESS) {
+        return decided(status, status === PurchaseStatus.SOLD_OUT);
+      }
 
-      const decision = await this.decide(tx, request);
+      const orderId = await this.insertOrder(tx, request);
+      if (!orderId) return this.correctStatus(tx, request, PurchaseStatus.ALREADY_PURCHASED);
 
-      await tx
-        .update(purchaseRequests)
-        .set({ status: decision.status, processedAt: new Date() })
-        .where(eq(purchaseRequests.id, request.purchaseRequestId));
-
-      return { ...decision, redelivered: false };
+      const remainingStock = await this.takeUnit(tx, request.flashSaleId);
+      if (remainingStock === null) {
+        await tx.delete(orders).where(eq(orders.id, orderId));
+        return this.correctStatus(tx, request, PurchaseStatus.SOLD_OUT);
+      }
+      return decided(PurchaseStatus.SUCCESS, remainingStock === 0);
     });
   }
 
-  private async decide(
-    tx: DatabaseTransaction,
-    request: PurchaseRequestMessage,
-  ): Promise<Decision> {
+  private async findSale(tx: DatabaseTransaction, flashSaleId: string) {
     const [sale] = await tx
       .select({
         startsAt: flashSales.startsAt,
@@ -51,16 +67,35 @@ export class FulfillmentRepository {
         remainingStock: flashSales.remainingStock,
       })
       .from(flashSales)
-      .where(eq(flashSales.id, request.flashSaleId));
+      .where(eq(flashSales.id, flashSaleId));
+    if (!sale) throw new Error(`Flash sale ${flashSaleId} not found`);
+    return sale;
+  }
 
-    if (!isWithinWindow(sale, new Date(request.acceptedAt))) {
-      return { status: PurchaseStatus.SALE_NOT_ACTIVE, soldOut: false };
-    }
+  private async recordRequest(
+    tx: DatabaseTransaction,
+    request: PurchaseRequestMessage,
+    status: PurchaseStatus,
+  ): Promise<boolean> {
+    const inserted = await tx
+      .insert(purchaseRequests)
+      .values({
+        id: request.purchaseRequestId,
+        flashSaleId: request.flashSaleId,
+        userId: request.userId,
+        status,
+        acceptedAt: new Date(request.acceptedAt),
+        processedAt: new Date(),
+      })
+      .onConflictDoNothing({ target: purchaseRequests.id })
+      .returning({ id: purchaseRequests.id });
+    return inserted.length > 0;
+  }
 
-    if (sale.remainingStock === 0) {
-      return { status: PurchaseStatus.SOLD_OUT, soldOut: true };
-    }
-
+  private async insertOrder(
+    tx: DatabaseTransaction,
+    request: PurchaseRequestMessage,
+  ): Promise<string | null> {
     const [order] = await tx
       .insert(orders)
       .values({
@@ -70,39 +105,29 @@ export class FulfillmentRepository {
       })
       .onConflictDoNothing({ target: [orders.flashSaleId, orders.userId] })
       .returning({ id: orders.id });
-    if (!order) {
-      return { status: PurchaseStatus.ALREADY_PURCHASED, soldOut: false };
-    }
+    return order?.id ?? null;
+  }
 
+  /** Returns the stock left after taking one unit, or null if none was left. */
+  private async takeUnit(tx: DatabaseTransaction, flashSaleId: string): Promise<number | null> {
     const [stock] = await tx
       .update(flashSales)
       .set({ remainingStock: sql`${flashSales.remainingStock} - 1` })
-      .where(and(eq(flashSales.id, request.flashSaleId), gt(flashSales.remainingStock, 0)))
+      .where(and(eq(flashSales.id, flashSaleId), gt(flashSales.remainingStock, 0)))
       .returning({ remainingStock: flashSales.remainingStock });
-    if (!stock) {
-      await tx.delete(orders).where(eq(orders.id, order.id));
-      return { status: PurchaseStatus.SOLD_OUT, soldOut: true };
-    }
-
-    return { status: PurchaseStatus.SUCCESS, soldOut: stock.remainingStock === 0 };
+    return stock?.remainingStock ?? null;
   }
 
-  private async recordRequest(
+  private async correctStatus(
     tx: DatabaseTransaction,
     request: PurchaseRequestMessage,
-  ): Promise<boolean> {
-    const inserted = await tx
-      .insert(purchaseRequests)
-      .values({
-        id: request.purchaseRequestId,
-        flashSaleId: request.flashSaleId,
-        userId: request.userId,
-        status: PurchaseStatus.PENDING,
-        acceptedAt: new Date(request.acceptedAt),
-      })
-      .onConflictDoNothing({ target: purchaseRequests.id })
-      .returning({ id: purchaseRequests.id });
-    return inserted.length > 0;
+    status: PurchaseStatus,
+  ): Promise<FulfillmentOutcome> {
+    await tx
+      .update(purchaseRequests)
+      .set({ status })
+      .where(eq(purchaseRequests.id, request.purchaseRequestId));
+    return decided(status, status === PurchaseStatus.SOLD_OUT);
   }
 
   private async previousOutcome(

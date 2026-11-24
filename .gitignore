@@ -7,4 +7,4 @@ coverage/
 !.env.example
 .DS_Store
 *.log
-tests/load/results/
+apps/backend/test/stress/results/

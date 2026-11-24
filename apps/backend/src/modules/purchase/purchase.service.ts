@@ -9,7 +9,11 @@ import { isWithinWindow } from '../sale/sale-status';
 import { SaleService } from '../sale/sale.service';
 import { PurchaseRejectedException } from './purchase-rejected.exception';
 import { PurchaseRequestRepository } from './purchase-request.repository';
-import { PurchaseRequestStore } from './purchase-request.store';
+import {
+  PurchaseRequestStore,
+  type ReserveInput,
+  type ReserveResult,
+} from './purchase-request.store';
 
 export interface CreatePurchaseResult {
   created: boolean;
@@ -39,7 +43,7 @@ export class PurchaseService {
     }
 
     const purchaseRequestId = randomUUID();
-    const reservation = await this.store.reserve({
+    const reservation = await this.reserve({
       flashSaleId,
       userId,
       purchaseRequestId,
@@ -91,6 +95,16 @@ export class PurchaseService {
     const request = await this.repository.findLatestByUser(flashSaleId, userId);
     if (!request) throw new NotFoundException('No purchase request for this user');
     return request;
+  }
+
+  /** Redis down means we cannot admit safely: fail closed with a retryable 503, not a 500. */
+  private async reserve(input: ReserveInput): Promise<ReserveResult> {
+    try {
+      return await this.store.reserve(input);
+    } catch (error) {
+      this.logger.error({ err: error }, 'Failed to reserve purchase request');
+      throw new ServiceUnavailableException('Could not accept the purchase right now, please retry');
+    }
   }
 
   private async enqueue(message: PurchaseRequestMessage): Promise<void> {

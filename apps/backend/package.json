@@ -14,7 +14,9 @@
     "test:integration": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config test/jest-integration.config.js --runInBand",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:seed": "tsx --env-file-if-exists=../../.env scripts/seed.ts"
+    "db:seed": "tsx --env-file-if-exists=../../.env scripts/seed.ts",
+    "stress": "bash test/stress/run.sh",
+    "stress:verify": "tsx --env-file-if-exists=../../.env test/stress/verify.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1175.0",
