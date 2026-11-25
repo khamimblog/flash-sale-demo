@@ -31,17 +31,24 @@ Requirements: Docker, Node 24 and pnpm 10 (`corepack enable`).
 ```bash
 cp .env.example .env
 pnpm install
-pnpm stack:up                 # Postgres, Redis, SQS, 2 APIs behind nginx, 2 workers
-pnpm db:seed                  # a sale with 1,000 units that starts now and lasts 5 minutes
-open http://localhost:8080
+pnpm stack:up                          # Postgres, Redis, SQS, 2 APIs behind nginx, 2 workers
+pnpm db:seed --reset --duration 30m    # a fresh sale: 1,000 units, starts now, open 30 minutes
 ```
 
-`pnpm db:seed --stock 100 --starts-in 1m --duration 10m` configures the sale window and stock.
-Add `--reset` to start from a clean slate. It also clears the queues and Redis.
+Then open **http://localhost:8080** in your browser.
 
-> The `stack:*` and `infra:*` scripts call `docker-compose`. With Compose v2, run
-> `docker compose up -d --build` instead. Compose v1.29 has a known `'ContainerConfig'` error
-> when it recreates containers on newer Docker engines; `docker-compose down` first avoids it.
+| To | Run |
+|---|---|
+| Stop everything (data is kept) | `pnpm stack:down` |
+| Restart, e.g. after pulling changes | `pnpm stack:down && pnpm stack:up` |
+| Start a new sale from a clean slate | `pnpm db:seed --reset --duration 30m` |
+| Change the sale | `--stock 100` (units), `--starts-in 1m` (show the countdown), `--duration 10m` |
+
+`--reset` clears all sales, orders, queued messages and Redis keys before creating the new
+sale. The scripts use Docker Compose v2 (`docker compose`) when it is installed, and fall back
+to v1 (`docker-compose`). With v1, run `pnpm stack:down` before `pnpm stack:up` on a running
+stack: v1 has a known `'ContainerConfig'` error when it recreates containers on newer Docker
+engines.
 
 ## Architecture
 
@@ -53,10 +60,7 @@ flowchart LR
         nginx[nginx<br/>static app + load balancer]
     end
 
-    subgraph api [API instances]
-        api1[API 1<br/>NestJS + Fastify]
-        api2[API 2<br/>NestJS + Fastify]
-    end
+    api[API ×2, identical<br/>NestJS + Fastify<br/>sale · purchase · notifications/SSE]
 
     subgraph async [Async processing]
         q1[[SQS<br/>purchase-requests]]
@@ -68,17 +72,21 @@ flowchart LR
     pg[(Postgres<br/>source of truth)]
 
     user -- "HTTP + SSE" --> nginx
-    nginx --> api1 & api2
-    api1 & api2 -- "1 · admit: Lua script" --> redis
-    api1 & api2 -- "2 · enqueue" --> q1
+    nginx -- "round-robin" --> api
+    api -- "1 · admit: Lua script" --> redis
+    api -- "2 · enqueue" --> q1
     q1 --> workers
     workers -- "3 · decide: one transaction" --> pg
     workers -- "reconcile counter" --> redis
     workers -- "4 · result" --> q2
-    q2 --> api1 & api2
-    api1 & api2 -- "5 · save status, publish" --> redis
-    redis -. "pub/sub to every instance → SSE" .-> api1 & api2
+    q2 -- "to any one instance" --> api
+    api -- "5 · save status, publish" --> redis
+    redis -. "pub/sub to every instance → SSE" .-> api
 ```
+
+Both API instances run the same code and handle every endpoint; nginx spreads requests
+across them. SQS hands each result to just one instance, but the buyer's SSE connection may
+be on the other, so the result is broadcast through Redis pub/sub to all instances.
 
 | Component | Role | Cloud equivalent |
 |---|---|---|
@@ -282,11 +290,14 @@ cp .env.example .env
 pnpm install
 pnpm infra:up                 # Postgres :5433, Redis :6379, ElasticMQ :9324 (UI :9325)
 pnpm db:migrate
-pnpm db:seed
+pnpm db:seed --reset --duration 30m
 pnpm dev:api                  # http://localhost:3000
 pnpm dev:worker
 pnpm dev:web                  # http://localhost:5173 (proxies /api to :3000)
 ```
+
+Use either this or `pnpm stack:up`, not both: the full stack doesn't expose the API on :3000,
+and both run workers on the same queues.
 
 Tests:
 
