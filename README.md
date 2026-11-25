@@ -278,7 +278,7 @@ Run it yourself:
 
 ```bash
 pnpm stack:up
-BASE_URL=http://localhost:8080 RATE=2500 DURATION=30s STOCK=1000 pnpm stress
+RATE=2500 DURATION=30s STOCK=1000 pnpm stress
 ```
 
 ## Running locally and testing
@@ -313,9 +313,10 @@ pnpm typecheck && pnpm lint
   - the worker's transaction: 300 concurrent buyers for 50 units, one user × 25 concurrent
     requests, concurrent redeliveries;
   - the SSE notification flow.
-- **Stress tests** need the API and worker running, either via `pnpm stack:up` with
-  `BASE_URL=http://localhost:8080`, or via `pnpm build` and `start:api` / `start:worker`.
-  See the [stress test README](apps/backend/test/stress/README.md). k6 runs from its Docker
+- **Stress tests** need the system running. With `pnpm stack:up`, plain `pnpm stress` targets
+  nginx on :8080. With the apps on the host (`dev:api` / `start:api` and a worker), pass
+  `BASE_URL=http://localhost:3000`. Each run resets the demo data: it seeds its own sale. See
+  the [stress test README](apps/backend/test/stress/README.md). k6 runs from its Docker
   image, so it doesn't need to be installed.
 
 ## API

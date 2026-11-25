@@ -5,13 +5,16 @@
 no oversell, one item per user, every accepted request processed, nothing dead-lettered.
 
 ```bash
-pnpm build
-pnpm --filter @flash-sale-demo/backend start:api      # separate terminals
-pnpm --filter @flash-sale-demo/backend start:worker
+pnpm stack:up                                # the full stack, behind nginx on :8080
 pnpm stress                                  # 1000 attempts/s for 30s, 1000 units
-RATE=2500 DURATION=30s STOCK=1000 pnpm stress
+RATE=2500 DURATION=30s STOCK=1000 pnpm stress                 # overload: see load shedding
 RATE=500 DURATION=15s STOCK=50000 RETRY_RATIO=0 pnpm stress   # every request reaches the worker
 ```
+
+`pnpm stress` targets `http://localhost:8080` by default and stops with a clear message if the
+API isn't reachable, before touching any data. To test the apps run on the host instead
+(`pnpm build`, then `start:api` and `start:worker`), add `BASE_URL=http://localhost:3000`.
+Each run **resets the demo data** (`db:seed --reset`); seed a normal sale again afterwards.
 
 k6 runs from the `grafana/k6` Docker image, so it does not need to be installed.
 Each run is saved under `results/<timestamp>/` (git-ignored).
@@ -59,7 +62,7 @@ is held for one `UPDATE` plus the `COMMIT` instead of three round trips.
 
 ## Full stack: nginx + 2 API instances + 2 workers (2026-11-24)
 
-`pnpm stack:up`, then `BASE_URL=http://localhost:8080 pnpm stress`. Everything runs in Docker
+`pnpm stack:up`, then `pnpm stress`. Everything runs in Docker
 on the same laptop (nginx ≈ 1 core and k6 ≈ 1.5 cores of it). Workers: 2 pollers each.
 
 | Scenario | Achieved | Purchase latency (p50 / p95 / p99) | Accepted → decided (p50 / p95) | Guarantees |
